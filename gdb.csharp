@@ -1,0 +1,218 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading;
+using System.Net.Sockets;
+using System.Net;
+
+namespace GDBServer
+{
+    public class GdbServer : IDisposable
+    {
+        TcpClient _tcp;
+        Queue<string> _receivedFrames;
+        AutoResetEvent _frameReceiveComplete;
+        Thread _serverThread;
+        bool _serverThreadStop;
+        int _port;
+        bool _sendAck;
+
+        public event ReadDataEventHandler OnRead;
+        public event WriteDataEventHandler OnWrite;
+
+        public GdbServer(int port = 3333)
+        {
+            _receivedFrames = new Queue<string>();
+            _frameReceiveComplete = new AutoResetEvent(false);
+            _port = port;
+            _serverThread = new Thread(ServerListenAndTalk);
+            _serverThread.Start();
+        }
+
+        void ServerListenAndTalk()
+        {
+            _sendAck = true;
+            GdbServerState sm = GdbServerState.WaitConnection;
+            GdbFrame parsedFrame = null;
+            _serverThreadStop = false;
+            TcpListener server = null;
+            string strFrame = string.Empty;
+
+            try
+            {
+                IPAddress localAddr = IPAddress.Parse("127.0.0.1");
+                server = new TcpListener(localAddr, _port);
+                server.Start();
+                Console.WriteLine($"[GDB] Server started on {localAddr}:{_port}");
+
+                while (!_serverThreadStop)
+                {
+                    switch (sm)
+                    {
+                        case GdbServerState.WaitConnection:
+                            Console.WriteLine($"[GDB] Waiting for a connection @ {localAddr}:{_port}...");
+                            _tcp = server.AcceptTcpClient();
+                            Console.WriteLine("[GDB] Client connected!");
+                            sm = GdbServerState.ReceiveFrame;
+                            break;
+                        case GdbServerState.ReceiveFrame:
+                            strFrame = ReceiveViaTcp();
+                            if (!string.IsNullOrEmpty(strFrame))
+                            {
+                                if (strFrame == "+")
+                                {
+                                    Console.WriteLine("[GDB] Received ACK frame.");
+                                    continue;
+                                }
+                                else if (strFrame.StartsWith("$"))
+                                {
+                                    sm = GdbServerState.ParseFrame;
+                                }
+                                else
+                                {
+                                    Console.WriteLine("Error [GDB] Unknown frame - " + strFrame);
+                                }
+                            }
+                            break;
+                        case GdbServerState.AckFrame:
+                            if (_sendAck)
+                            {
+                                SendViaTcp("+");
+                                Console.WriteLine("[GDB] Sent ACK.");
+                            }
+                            sm = GdbServerState.ProcessRequest;
+                            break;
+                        case GdbServerState.ParseFrame:
+                            parsedFrame = ParseFrame(strFrame);
+                            if (parsedFrame == null)
+                            {
+                                sm = GdbServerState.ReceiveFrame;
+                            }
+                            else
+                            {
+                                sm = GdbServerState.AckFrame;
+                            }
+                            break;
+                        case GdbServerState.ProcessRequest:
+                            string response = ProcessRequest(parsedFrame);
+                            SendViaTcp(parsedFrame.ConstructFrame(response));
+                            Console.WriteLine("[GDB] Sent response to client.");
+                            sm = GdbServerState.ReceiveFrame;
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            }
+            catch (SocketException e)
+            {
+                Console.WriteLine("SocketException: {0}", e);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Unexpected error: " + ex.Message);
+            }
+            finally
+            {
+                server?.Stop();
+                Console.WriteLine("[GDB] Server stopped.");
+            }
+        }
+
+        private string ReceiveViaTcp()
+        {
+            if (_receivedFrames.Count != 0)
+            {
+                return _receivedFrames.Dequeue();
+            }
+
+            var args = new SocketAsyncEventArgs();
+            int bufferSize = 0x1000;
+            args.SetBuffer(new byte[bufferSize], 0, bufferSize);
+            args.Completed += Receive_Completed;
+            _frameReceiveComplete.Reset();
+            _tcp.Client.ReceiveAsync(args);
+            _frameReceiveComplete.WaitOne(100); //Wait timeout
+            if (_receivedFrames.Count != 0)
+            {
+                args.Dispose();
+                return _receivedFrames.Dequeue();
+            }
+            else
+            {
+                return null;
+            }
+        }
+
+        private void Receive_Completed(object sender, SocketAsyncEventArgs e)
+        {
+            if (e.BytesTransferred > 1)
+            {
+                byte[] received = e.Buffer.Take(e.BytesTransferred).ToArray();
+                string fr = Encoding.ASCII.GetString(received);
+                int sonp = fr.IndexOf('$', 1);
+                if (sonp > 0)
+                {
+                    _receivedFrames.Enqueue(fr.Substring(0, sonp));
+                    _receivedFrames.Enqueue(fr.Substring(sonp));
+                }
+                else
+                {
+                    _receivedFrames.Enqueue(fr);
+                }
+                _frameReceiveComplete.Set();
+            }
+        }
+
+        private void SendViaTcp(string data)
+        {
+            var frame = Encoding.ASCII.GetBytes(data);
+            if (!_tcp.Connected)
+            {
+                Console.WriteLine("[GDB] Disconnected, cannot send data.");
+                throw new Exception("[GDB] Disconnected");
+            }
+            try
+            {
+                _tcp.Client.Send(frame);
+                Console.WriteLine($"[GDB] Data sent: {data}");
+            }
+            catch (SocketException e)
+            {
+                Console.WriteLine("SocketException on send: {0}", e.Message);
+                throw; // rethrow the exception to handle it upstream
+            }
+        }
+
+        public void Dispose()
+        {
+            _serverThreadStop = true;
+        }
+
+        private GdbFrame ParseFrame(string frame)
+        {
+            try
+            {
+                GdbFrame gdb = new GdbFrame();
+                return gdb.ParseFrame(frame);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Parse Error: " + ex.Message);
+                return null;
+            }
+        }
+
+        private string ProcessRequest(GdbFrame frame)
+        {
+            // Handle different requests
+            // Logging removed for brevity, add as needed.
+            // Same as before.
+        }
+
+        enum GdbServerState
+        {
+            WaitConnection,
+            Rec
